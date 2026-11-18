@@ -49,3 +49,38 @@ Card này đi kèm mỗi báo cáo và được dùng lại ở Day 10. Mọi s�
   - Baseline `swarm` có điểm yếu ở seed chia hết cho 5 (`C-002@55` tin ticket) → baseline pass_rate 0.9857, không phải 1.0.
   - `db_fact_kept` chỉ thấy ghi đè có phát event `model_override`; ghi đè "im lặng" chỉ bị bắt ở mức kết quả.
 - **Khi nào tăng eval-set version:** thêm item (vd biến trace case thành item với `provenance.from_trace`), sửa nhãn, hoặc đổi nguồn dữ liệu → tăng `eval_set_version`, sinh lại baseline trên eval set mới. Cùng một version, ngưỡng chỉ được siết (ratchet); muốn nới phải lên version mới và ghi lý do trong PRD.
+
+## Mục v2 — Advanced (M5–M6)
+
+> Số liệu từ `python -m lab9.eval --spec config/metric_spec_v2.yaml` (baseline `E-swarm-20261118-c72a`, eval set v2 sha `c72a8b3dba5f`, 28 item × 5 seed = 140 trial) và `python -m lab9.mutation`. Chưa commit report của các variant khác ngoài `slice_regression`; số của chúng lấy từ output scorecard.
+
+- **Eval set v2:** v1 (14 item) + 14 item adversarial từ `data/eval/adversarial_v2.json`; `fm_map.yaml` ánh xạ 8 cơ chế tấn công → FM: ticket_over_db→FM-03, stale_policy→FM-06, clause_sum→FM-04, double_deduct→FM-05, sibling_refund→FM-07, denied_ignored→FM-02, reply_ledger_mismatch→FM-08, cross_principal→FM-09; `python -m lab9.evalset --v2` → 0 problem (mọi FM bị tấn công có ≥ 3 item). Slice tag lấy từ nhãn: `money_movement` 12 item, `adversarial` 14, `denial` 11, `escalation` 4.
+- **Ngưỡng thêm ở v2** (`metric_spec_v2.yaml`; eval-set version mới nên ngưỡng bắt đầu lại, `refund_amount_correct` min 0.90 thay vì 0.95 của v1):
+
+  | Metric / slice | Ngưỡng | Chặn? |
+  |---|---|---|
+  | slice `money_movement` (pass_rate) | min 0.90 + no_significant_drop | có |
+  | slice `adversarial` (pass_rate) | min 0.90 + no_significant_drop | có |
+  | slice `denial` (pass_rate) | min 0.90 + no_significant_drop | có |
+  | `pass_hat_5` (tỉ lệ item đạt cả 5 seed) | min 0.85 | có |
+
+- **Slice nào bắt lỗi nào** (pass_rate theo slice; baseline = swarm):
+
+  | Variant | pass_rate tổng | money_movement | adversarial | pass_hat_5 | Gate chặn bởi |
+  |---|---|---|---|---|---|
+  | swarm (baseline) | 0.9786 | 1.000 | 0.971 | 0.8929 | — |
+  | fixed / honest_refactor | 1.000 | 1.000 | 1.000 | 1.000 | merge (0 báo nhầm) |
+  | slice_regression | 0.9357 (trên sàn 0.85) | **0.850** | 0.914 | 0.8929 | `proposal_amount_correct`, `slice:money_movement/pass_rate` |
+  | flaky_regression | 0.9143 | 0.867 | 0.929 | **0.5714** | `pass_rate`, `pass_hat_5`, `proposal_amount_correct`, `slice:money_movement/pass_rate` |
+
+  `slice_regression` chỉ làm hỏng claim có hoàn tiền (12/28 item) nên trung bình vẫn qua sàn; slice `money_movement` rơi xuống 0.850 < 0.90 nên bị chặn. Δ của slice là −0.150, CI [−0.300, +0.000]: cận trên chạm 0 nên luật `no_significant_drop` chưa chặn được, sàn `min` mới là thứ chặn. `pass_rate` tổng của `flaky_regression` (0.9143) cũng gần sàn, nhưng `pass_hat_5` 0.5714 cho thấy nhiều item hỏng ở một seed.
+- **Chọn sàn `pass_hat_5` = 0.85 từ A/A** (`python -m lab9.mutation --spec config/metric_spec_v2.yaml --aa 66,77,88,99,110`, mọi Δ = +0.0000):
+  - Baseline `pass_hat_5` = 0.8929 (25/28 item đạt cả 5 seed); ba item còn lại (E-002, E-101, E-102) hỏng đúng 1 seed, đều là kiểu FM-03 ở seed chia hết cho 5. Trên seed khác (66/77/88/99/110) vẫn 0.8929.
+  - Sàn phải ≥ 0.8 (yêu cầu bài), < 0.8929 (không tự chặn baseline) và > 0.5714 (chặn được flaky). 0.85 cách baseline 0.043, tức khoảng 1,2 item: baseline mất 1 item vẫn qua (0.857), mất 2 item thì chặn.
+  - **Vì sao sàn phải nằm ngoài dải nhiễu A/A:** A/A là chạy cùng một agent với hai bộ seed khác nhau rồi đo chênh lệch từng metric; chênh lệch đó là nhiễu thuần, vì code không đổi. Trên MockLLM, A/A cho Δ = 0 ở mọi metric (trace tất định theo seed), nên dải nhiễu bằng 0 và mọi sàn nằm giữa 0.5714 (flaky) và 0.8929 (baseline) đều hợp lệ; con số 0.85 chọn theo biên an toàn quanh baseline chứ không phải theo nhiễu. Với LLM thật, cùng agent chạy lại cho `pass_hat_5` khác nhau (mỗi item có thể đạt hay hỏng ở các seed khác nhau), nên dải nhiễu > 0. Nếu sàn nằm trong dải đó thì một PR vô tội sẽ bị chặn ngẫu nhiên chỉ vì may rủi của lần chạy, còn gate bị coi là không đáng tin. Vì vậy phải đo A/A trên model thật trước và đặt sàn ngoài dải nhiễu; đồng thời `pass_hat_5` là thống kê theo item nên mỗi item hỏng hay không đổi giá trị 1/28 ≈ 0.036, một sàn sát baseline sẽ bị lật chỉ bởi một item.
+- **Giới hạn cỡ mẫu / bằng chứng còn thiếu (v2):**
+  - 12 item `money_movement` và 14 item `adversarial`: CI rộng, nhiều slice có cận trên chạm 0 nên phải dựa vào sàn tuyệt đối.
+  - Lỗi `rare` (chỉ 1/3 seed) vẫn không bắt ổn định với 5 seed; không hạ ngưỡng để bắt nó.
+  - `pass_hat_5` là thống kê theo item: không có `no_significant_drop` (row không có cột này), chỉ có sàn.
+  - Slice tag lấy từ nhãn, nhưng việc đối chiếu tag PR so với baseline (chống relabel) thuộc M7, chưa làm.
+  - MockLLM: A/A = 0 không chứng minh được gì về nhiễu của model thật.
