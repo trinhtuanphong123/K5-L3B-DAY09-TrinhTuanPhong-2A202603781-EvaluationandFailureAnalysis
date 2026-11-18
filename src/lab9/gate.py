@@ -11,11 +11,61 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from lab8.console import utf8_stdio
 from lab9 import stats
 from lab9.eval import SPEC, load_spec, per_item
+
+
+def _graded_ids(spec: dict, base: dict) -> list[str]:
+    """Metric ids graded per row: an id in spec["metrics"] AND a key of at least one baseline row."""
+    ids = {m["id"] for m in spec.get("metrics", [])}
+    keys: set[str] = set()
+    for r in base.get("rows") or []:
+        keys.update(r.keys())
+    return sorted(ids & keys)
+
+
+def _ratchet_problems(spec: dict, base_spec: dict) -> list[str]:
+    """Reasons a spec loosened a threshold of base_spec on the same eval-set version (D6)."""
+    if spec.get("eval_set_version") != base_spec.get("eval_set_version"):
+        return []
+    problems: list[str] = []
+    new = {m["id"]: m for m in spec.get("metrics", []) or []}
+    for old in base_spec.get("metrics", []) or []:
+        mid = old["id"]
+        if mid not in new:
+            problems.append(f"ratchet: metric {mid} removed")
+            continue
+        n = new[mid]
+        ot, nt = old.get("threshold", {}) or {}, n.get("threshold", {}) or {}
+        if old.get("blocking") and not n.get("blocking"):
+            problems.append(f"ratchet: metric {mid} no longer blocking")
+        for key in ("min",):
+            if key in ot and (key not in nt or nt[key] < ot[key] - 1e-12):
+                problems.append(f"ratchet: metric {mid} {key} loosened ({ot[key]} -> {nt.get(key)})")
+        for key in ("max", "max_increase"):
+            if key in ot and (key not in nt or nt[key] > ot[key] + 1e-12):
+                problems.append(f"ratchet: metric {mid} {key} loosened ({ot[key]} -> {nt.get(key)})")
+        if ot.get("no_significant_drop") and not nt.get("no_significant_drop"):
+            problems.append(f"ratchet: metric {mid} no_significant_drop dropped")
+
+    snew = {(s["name"], s["metric"]): s for s in spec.get("slices", []) or []}
+    for old in base_spec.get("slices", []) or []:
+        sid = f"{old['name']}/{old['metric']}"
+        if (old["name"], old["metric"]) not in snew:
+            problems.append(f"ratchet: slice {sid} removed")
+            continue
+        n = snew[(old["name"], old["metric"])]
+        if "min" in old and ("min" not in n or n["min"] < old["min"] - 1e-12):
+            problems.append(f"ratchet: slice {sid} min loosened ({old['min']} -> {n.get('min')})")
+        if old.get("blocking") and not n.get("blocking"):
+            problems.append(f"ratchet: slice {sid} no longer blocking")
+        if old.get("no_significant_drop") and not n.get("no_significant_drop"):
+            problems.append(f"ratchet: slice {sid} no_significant_drop dropped")
+    return problems
 
 
 def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = None) -> list[str]:
@@ -33,8 +83,84 @@ def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = N
         including dropping no_significant_drop)
       - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
         slice hides its regression from the slice gate)"""
-    # TODO M7
-    return []
+    problems: list[str] = []
+    rows = pr.get("rows") or []
+    brows = base.get("rows") or []
+    man = pr.get("manifest") or {}
+
+    # D1: a non-finite total or row value is a report we cannot trust.
+    for k, v in (pr.get("metrics") or {}).items():
+        if isinstance(v, float) and not math.isfinite(v):
+            problems.append(f"metric {k} is {v} (not finite)")
+    bad_values: list[str] = []
+    for i, r in enumerate(rows):
+        for k, v in r.items():
+            if isinstance(v, float) and not math.isfinite(v):
+                bad_values.append(f"row {i} ({r.get('item_id')}@{r.get('seed')}) field {k} is {v}")
+    if len(bad_values) > 5:
+        problems.extend(bad_values[:5])
+        problems.append(f"... and {len(bad_values) - 5} more non-finite row values")
+    else:
+        problems.extend(bad_values)
+
+    # D2: the row count the manifest promises, and no (item, seed) appearing twice.
+    n_seeds = len(man.get("seeds", []) or [])
+    want_rows = int(man.get("items", 0)) * n_seeds
+    if len(rows) != want_rows:
+        problems.append(f"{len(rows)} rows, manifest says {man.get('items')} items x {n_seeds} seeds = {want_rows}")
+    keys = [(r.get("item_id"), r.get("seed")) for r in rows]
+    if len(set(keys)) != len(keys):
+        problems.append(f"{len(keys) - len(set(keys))} duplicate (item_id, seed) row(s)")
+
+    # D3: the PR must cover exactly the baseline's items and seeds (no cherry-picking, no drops).
+    bkeys = {(r.get("item_id"), r.get("seed")) for r in brows}
+    pkeys = set(keys)
+    if pkeys != bkeys:
+        problems.append(f"(item, seed) set differs from baseline: {len(bkeys - pkeys)} missing, "
+                        f"{len(pkeys - bkeys)} extra")
+
+    # D4: a crashed grader must never score as "missing" and quietly leave the mean.
+    if pr.get("evaluator_failures"):
+        problems.append(f"{len(pr['evaluator_failures'])} evaluator failure(s): "
+                        f"{pr['evaluator_failures'][0]}")
+    graded = _graded_ids(spec, base)
+    for mid in graded:
+        n = sum(1 for r in rows if r.get(mid) is None)
+        if n:
+            problems.append(f"metric {mid}: {n} row(s) without a value (grader crashed or dropped)")
+
+    # D5: the totals must be recomputable from the rows (hand-edited numbers show up here).
+    totals = pr.get("metrics") or {}
+    for mid in graded:
+        if mid not in totals:
+            continue
+        v = totals[mid]
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+            continue
+        vals = [r[mid] for r in rows if r.get(mid) is not None]
+        if not vals:
+            continue
+        want = sum(vals) if mid in ("approval_bypass", "secret_leak") else round(sum(vals) / len(vals), 4)
+        if abs(v - want) > 0.001:
+            problems.append(f"metric {mid} = {v} but rows give {want}")
+
+    # D7: relabelling an item out of a slice hides its regression from the slice gate.
+    def _tags(rs: list) -> dict[str, set]:
+        out: dict[str, set] = {}
+        for r in rs:
+            out.setdefault(r.get("item_id"), set()).update(r.get("slices") or [])
+        return out
+
+    ptags, btags = _tags(rows), _tags(brows)
+    differ = [f"{iid} {sorted(btags[iid])} -> {sorted(ptags[iid])}"
+              for iid in sorted(set(ptags) & set(btags)) if ptags[iid] != btags[iid]]
+    if differ:
+        problems.append(f"slice tags differ from baseline for {len(differ)} item(s): "
+                        + ", ".join(differ[:3]) + (" ..." if len(differ) > 3 else ""))
+
+    if base_spec is not None:
+        problems += _ratchet_problems(spec, base_spec)
+    return problems
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:
